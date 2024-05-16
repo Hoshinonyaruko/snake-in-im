@@ -8,8 +8,9 @@ import (
 
 // AppConfig holds the structure of the configuration
 type AppConfig struct {
-	SelfPath string `json:"selfpath"`
-	Port     string `json:"port"`
+	SelfPath  string `json:"selfpath"`
+	Port      string `json:"port"`
+	Blocksize int    `json:"blocksize"`
 }
 
 var (
@@ -21,8 +22,9 @@ var (
 func LoadConfig(filePath string) *AppConfig {
 	once.Do(func() {
 		instance = &AppConfig{
-			SelfPath: "http://www.example.com", // Default value
-			Port:     "38870",                  // Default value
+			SelfPath:  "http://www.example.com", // Default value
+			Port:      "38870",                  // Default value
+			Blocksize: 20,
 		}
 		// Load the config file if it exists, otherwise create one
 		if _, err := os.Stat(filePath); os.IsNotExist(err) {
@@ -63,12 +65,14 @@ func saveConfig(filePath string) {
 }
 
 // GetConfigValue returns the value of the configuration by key
-func GetConfigValue(key string) string {
+func GetConfigValue(key string) interface{} {
 	switch key {
 	case "selfpath":
 		return instance.SelfPath
 	case "port":
 		return instance.Port
+	case "blocksize":
+		return instance.Blocksize
 	default:
 		return ""
 	}

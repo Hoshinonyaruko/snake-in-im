@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"image/png"
 	"log"
 	"math"
 	"net/http"
@@ -12,8 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/disintegration/imaging"
 	"github.com/fogleman/gg"
 	"github.com/gin-gonic/gin"
 	"github.com/hoshinonyaruko/snake-in-im/config"
@@ -101,7 +104,7 @@ func RenderMapHandler(db *sql.DB) gin.HandlerFunc {
 
 		if avatarUrl != "" {
 			// Process and save the avatar
-			err := snake.ProcessAndSaveAvatar(avatarUrl, openID)
+			err := snake.ProcessAndSaveAvatar(avatarUrl, openID, config.GetConfigValue("blocksize").(int))
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Unable to process avatar"})
 				return
@@ -115,15 +118,17 @@ func RenderMapHandler(db *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Unable to fetch or create game map"})
 			return
 		}
+
 		// 贪食蛇刷新
 		snake.UpdateGameMapIfNeeded(gameMap, openID) // Check and update the game map state
 		// 食物刷新
 		if foodName != "" {
 			snake.AddFoodToGameMap(gameMap, foodName)
 		}
+		// 绘图
 		renderImageAndSave(&gameMap.Map, groupID, openID) // Render the map and save as an image
 
-		imageUrl := fmt.Sprintf("http://%s/static/%s.jpg", config.GetConfigValue("selfpath"), groupID)
+		imageUrl := fmt.Sprintf("http://%s/static/%s.jpg", config.GetConfigValue("selfpath").(string), groupID)
 		c.JSON(http.StatusOK, gin.H{"image_url": imageUrl})
 
 		// 持久化
@@ -165,7 +170,7 @@ func getOrCreateGameMap(db *sql.DB, groupID string, width, height, refreshInterv
 		// Initialize empty snakes map and food position
 		game.Map.Snakes = make(map[string]structs.Snake)
 		// 初始化食物位置
-		game.Map.Food = []structs.Position{snake.GenerateRandomPositionWithAvatar(game.Map.Width, game.Map.Height, "food.png")}
+		game.Map.Food = []structs.Position{snake.GenerateRandomPositionWithAvatar(game.Map.Width, game.Map.Height, "food_small.png")}
 
 	} else {
 		// Load snakes
@@ -226,7 +231,7 @@ func getOrCreateGameMap(db *sql.DB, groupID string, width, height, refreshInterv
 
 // renderImageAndSave 渲染地图并保存为图片
 func renderImageAndSave(gameMap *structs.GameMap, groupID, openID string) error {
-	// 固定每个方块为20像素
+	// 从配置中读取
 	const blockSize = 20
 	canvasWidth := gameMap.Width * blockSize
 	canvasHeight := gameMap.Height * blockSize
@@ -280,25 +285,29 @@ func renderImageAndSave(gameMap *structs.GameMap, groupID, openID string) error 
 		for _, pos := range snake.Positions {
 			img, found := memimg.GetAvatarFromMemory(pos.Avatar)
 			if found {
-				// 缩放图片以匹配 blockSize x blockSize 的尺寸
-				scaledImg := scaleImage(img, blockSize, blockSize)
-				// 在正确的位置绘制缩放后的图片
-				dc.DrawImage(scaledImg, pos.X*blockSize, pos.Y*blockSize)
+				dc.DrawImage(img, pos.X*blockSize, pos.Y*blockSize)
 			} else {
-				dc.SetRGB(0, 0, 0) // 如果图片加载失败，使用黑色表示该位置
-				dc.DrawRectangle(float64(pos.X*blockSize), float64(pos.Y*blockSize), float64(blockSize), float64(blockSize))
-				dc.Fill()
+				// 从内存食物中获取对应的食物图像
+				foodImg, found := memimg.GetFoodFromMemory(pos.Avatar)
+				if found {
+					dc.DrawImage(foodImg, pos.X*blockSize, pos.Y*blockSize)
+				} else {
+					// 如果食物图片未找到，使用黑色矩形表示该食物位置
+					dc.SetRGB(0, 0, 0) // 如果图片加载失败，使用黑色表示该位置
+					dc.DrawRectangle(float64(pos.X*blockSize), float64(pos.Y*blockSize), float64(blockSize), float64(blockSize))
+					dc.Fill()
+				}
+
 			}
 		}
 	}
 
 	// 绘制食物
 	for _, foodPos := range gameMap.Food {
-		// 从内存中获取对应的食物图像
-		foodImg, found := memimg.GetAvatarFromMemory(foodPos.Avatar)
+		// 从内存食物中获取对应的食物图像
+		foodImg, found := memimg.GetFoodFromMemory(foodPos.Avatar)
 		if found {
-			// 计算食物在画布上的坐标并绘制
-			dc.DrawImageAnchored(foodImg, foodPos.X*blockSize, foodPos.Y*blockSize, 0, 0)
+			dc.DrawImage(foodImg, foodPos.X*blockSize, foodPos.Y*blockSize)
 		} else {
 			// 如果食物图片未找到，使用黑色矩形表示该食物位置
 			dc.SetRGB(0, 0, 0)
@@ -313,19 +322,65 @@ func renderImageAndSave(gameMap *structs.GameMap, groupID, openID string) error 
 	return dc.SavePNG(fileName)
 }
 
-// scaleImage 重新设计以保持图片质量
 func scaleImage(img image.Image, newWidth, newHeight int) image.Image {
-	// 创建一个与目标尺寸相同的画布
 	dc := gg.NewContext(newWidth, newHeight)
-
-	// 计算缩放比例
 	sx := float64(newWidth) / float64(img.Bounds().Dx())
 	sy := float64(newHeight) / float64(img.Bounds().Dy())
-
-	// 绘制缩放后的图片
-	dc.Scale(sx, sy)
-	dc.DrawImage(img, 0, 0)
-
-	// 返回缩放后的图片
+	scale := math.Min(sx, sy)
+	offsetX := (float64(newWidth) - float64(img.Bounds().Dx())*scale) / 2
+	offsetY := (float64(newHeight) - float64(img.Bounds().Dy())*scale) / 2
+	dc.Scale(scale, scale)
+	dc.DrawImage(img, int(offsetX/scale), int(offsetY/scale))
 	return dc.Image()
+}
+
+func PreloadAndScaleFoods(foodDirectory string, blockSize int) {
+	filepath.WalkDir(foodDirectory, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && filepath.Ext(path) == ".png" {
+			avatar := filepath.Base(path)
+			if strings.Contains(avatar, "_small") || strings.Contains(avatar, "_blur") {
+				// Skip processing if it's already a modified file
+				return nil
+			}
+
+			scaledAvatar := avatar[:len(avatar)-len(filepath.Ext(avatar))] + "_small.png"
+			blurAvatar := avatar[:len(avatar)-len(filepath.Ext(avatar))] + "_blur.png"
+
+			scaledAvatarPath := filepath.Join(foodDirectory, scaledAvatar)
+			blurAvatarPath := filepath.Join(foodDirectory, blurAvatar)
+
+			// Check if scaled and blurred images already exist
+			if _, err := os.Stat(scaledAvatarPath); os.IsNotExist(err) {
+				img, err := memimg.LoadImage(path)
+				if err != nil {
+					return err
+				}
+				scaledImg := scaleImage(img, blockSize, blockSize)
+				scaledOutFile, err := os.Create(scaledAvatarPath)
+				if err != nil {
+					return err
+				}
+				defer scaledOutFile.Close()
+				png.Encode(scaledOutFile, scaledImg)
+			}
+
+			if _, err := os.Stat(blurAvatarPath); os.IsNotExist(err) {
+				scaledImg, err := memimg.LoadImage(scaledAvatarPath) // Assuming memimg.LoadImage loads PNGs
+				if err != nil {
+					return err
+				}
+				blurImg := imaging.Blur(scaledImg, 3.5)
+				blurOutFile, err := os.Create(blurAvatarPath)
+				if err != nil {
+					return err
+				}
+				defer blurOutFile.Close()
+				png.Encode(blurOutFile, blurImg)
+			}
+		}
+		return nil
+	})
 }

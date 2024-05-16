@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/disintegration/imaging"
@@ -17,37 +18,37 @@ import (
 )
 
 // 处理和保存头像到avatar文件夹
-func ProcessAndSaveAvatar(avatarUrl, openID string) error {
-	// Download the avatar image
+func ProcessAndSaveAvatar(avatarUrl, openID string, blockSize int) error {
+	// 下载头像图片
 	resp, err := http.Get(avatarUrl)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	// Read the image data from response
+	// 从响应中读取图像数据
 	imgData, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
 
-	// Decode the image data
+	// 解码图像数据
 	img, _, err := image.Decode(bytes.NewReader(imgData))
 	if err != nil {
 		return err
 	}
 
-	// Write the original image data to a file
+	// 将原始图像数据保存为文件
 	avatarPath := fmt.Sprintf("./avatar/%s.jpg", openID)
 	err = os.WriteFile(avatarPath, imgData, 0644)
 	if err != nil {
 		return err
 	}
 
-	// Apply Gaussian Blur using the imaging library
-	blurredImg := imaging.Blur(img, 15) // Adjust the sigma parameter to control the strength of the blur
+	// 应用高斯模糊
+	blurredImg := imaging.Blur(img, 15) // 调整sigma参数以控制模糊的强度
 
-	// Save the blurred image
+	// 保存模糊后的图像
 	blurredAvatarPath := fmt.Sprintf("./avatar/%s_blur.jpg", openID)
 	outFile, err := os.Create(blurredAvatarPath)
 	if err != nil {
@@ -55,7 +56,20 @@ func ProcessAndSaveAvatar(avatarUrl, openID string) error {
 	}
 	defer outFile.Close()
 
-	jpeg.Encode(outFile, blurredImg, &jpeg.Options{Quality: 95}) // Save with high quality
+	jpeg.Encode(outFile, blurredImg, &jpeg.Options{Quality: 95}) // 以高质量保存
+
+	// 缩放图像到指定的blockSize
+	scaledImg := imaging.Resize(img, blockSize, blockSize, imaging.Lanczos)
+
+	// 保存缩小后的图像
+	smallAvatarPath := fmt.Sprintf("./avatar/%s_small.jpg", openID)
+	smallOutFile, err := os.Create(smallAvatarPath)
+	if err != nil {
+		return err
+	}
+	defer smallOutFile.Close()
+
+	jpeg.Encode(smallOutFile, scaledImg, &jpeg.Options{Quality: 95}) // 以高质量保存
 
 	return nil
 }
@@ -77,7 +91,7 @@ func UpdateGameMapIfNeeded(game *structs.Game, openID string) error {
 
 	// 检查并添加新蛇
 	if _, exists := game.Map.Snakes[openID]; !exists {
-		newPos := GenerateRandomPositionWithAvatar(game.Map.Width, game.Map.Height, fmt.Sprintf("%s.jpg", openID))
+		newPos := GenerateRandomPositionWithAvatar(game.Map.Width, game.Map.Height, fmt.Sprintf("%s_small.jpg", openID)) //小头像
 
 		// 随机选择一个方向
 		directions := []string{"up", "down", "left", "right"}
@@ -98,7 +112,6 @@ func UpdateGameMapIfNeeded(game *structs.Game, openID string) error {
 		}
 		CheckCollisions(&game.Map)
 	}
-
 	// 刷新新的时间
 	game.LastRefresh = currentTime
 
@@ -133,8 +146,15 @@ func MoveSnake(snake structs.Snake, width, height int) structs.Snake {
 	// 处理新位置可能超出边界的情况
 	newX, newY = WrapPosition(newX, newY, width, height)
 
-	// 创建新的头部位置，保留原头部的avatar属性
+	// 创建新的头部位置，使用前一个头部的avatar属性
 	newHead := structs.Position{X: newX, Y: newY, Avatar: head.Avatar}
+
+	// 更新蛇的每个部分的 Avatar
+	if len(snake.Positions) > 1 {
+		for i := len(snake.Positions) - 1; i > 0; i-- {
+			snake.Positions[i-1].Avatar = snake.Positions[i].Avatar
+		}
+	}
 
 	// 将新头部添加到位置列表，并且移除尾部，以保持蛇的长度
 	newPositions := append([]structs.Position{newHead}, snake.Positions...)
@@ -180,6 +200,9 @@ func CheckCollisions(gameMap *structs.GameMap) {
 		}
 	}
 
+	// 检查蛇头是否与食物重叠
+	CheckFoodCollisions(gameMap)
+
 	// 删除被吃掉的蛇
 	for id := range toDelete {
 		delete(gameMap.Snakes, id)
@@ -215,12 +238,39 @@ func UpdateAvatar(snake *structs.Snake, eatenOpenID string) {
 	}
 }
 
+// 贪食蛇吃食物函数
+func CheckFoodCollisions(gameMap *structs.GameMap) {
+	var newFoodPositions []structs.Position // 用于存放未被吃掉的食物
+	for _, snake := range gameMap.Snakes {
+		snakeHead := snake.Positions[0] // 蛇头位置
+		for i, foodPos := range gameMap.Food {
+			if snakeHead.X == foodPos.X && snakeHead.Y == foodPos.Y {
+				// 蛇吃食物
+				EatFood(&snake, foodPos)
+				//fmt.Printf("蛇吃掉了食物:%v\n", snake)
+				gameMap.Snakes[snake.OpenID] = snake // 更新蛇的状态
+				continue
+			}
+			// 如果食物未被吃掉，则保留
+			newFoodPositions = append(newFoodPositions, gameMap.Food[i])
+		}
+	}
+	gameMap.Food = newFoodPositions // 更新食物位置列表
+}
+
+func EatFood(snake *structs.Snake, foodPos structs.Position) {
+	// 将食物作为模糊形式添加到蛇的末尾
+	foodPos.Avatar = fmt.Sprintf("%s_blur.png", foodPos.Avatar)
+	foodPos.Avatar = strings.ReplaceAll(foodPos.Avatar, "_small.png", "")
+	snake.Positions = append(snake.Positions, foodPos)
+}
+
 // AddFoodToGameMap adds a new food item to the game map
 func AddFoodToGameMap(gameMap *structs.Game, foodName string) {
 	newFood := structs.Position{
 		X:      0,
 		Y:      0,
-		Avatar: foodName + ".png",
+		Avatar: foodName + "_small.png",
 	}
 
 	// Find a unique position that does not overlap with snakes or other food
