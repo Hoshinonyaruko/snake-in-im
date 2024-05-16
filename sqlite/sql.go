@@ -30,9 +30,9 @@ CREATE TABLE IF NOT EXISTS Snakes (
 
 const createFoodsTableSQL = `
 CREATE TABLE IF NOT EXISTS Foods (
+    ID INTEGER PRIMARY KEY AUTOINCREMENT,
     GroupID TEXT,
-    Position TEXT,
-    PRIMARY KEY (GroupID, Position)
+    Position TEXT
 );
 `
 
@@ -69,14 +69,21 @@ func UpdateGameMapInDB(db *sql.DB, game *structs.Game) error {
 		return err
 	}
 
-	// 更新食物位置
+	// 首先删除当前游戏组所有现有的食物记录
+	_, err = tx.Exec("DELETE FROM Foods WHERE GroupID = ?", game.GroupID)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	// 添加新的食物位置
 	for _, foodPos := range game.Map.Food {
 		foodData, err := json.Marshal(foodPos)
 		if err != nil {
 			tx.Rollback()
 			return err
 		}
-		_, err = tx.Exec("INSERT OR REPLACE INTO Foods (GroupID, Position) VALUES (?, ?)", game.GroupID, string(foodData))
+		_, err = tx.Exec("INSERT INTO Foods (GroupID, Position) VALUES (?, ?)", game.GroupID, string(foodData))
 		if err != nil {
 			tx.Rollback()
 			return err

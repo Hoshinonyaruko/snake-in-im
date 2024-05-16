@@ -13,6 +13,8 @@ import (
 var (
 	avatars      map[string]image.Image
 	avatarsMutex sync.RWMutex
+	foods        map[string]image.Image
+	foodsMutex   sync.RWMutex
 )
 
 func LoadAvatars(directory string) error {
@@ -22,7 +24,7 @@ func LoadAvatars(directory string) error {
 			return err
 		}
 		if !info.IsDir() {
-			img, err := loadImage(path)
+			img, err := LoadImage(path)
 			if err != nil {
 				return err
 			}
@@ -32,7 +34,7 @@ func LoadAvatars(directory string) error {
 	})
 }
 
-func loadImage(path string) (image.Image, error) {
+func LoadImage(path string) (image.Image, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -61,7 +63,7 @@ func WatchAvatars(directory string) {
 					return
 				}
 				if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
-					img, err := loadImage(event.Name)
+					img, err := LoadImage(event.Name)
 					if err == nil {
 						avatarsMutex.Lock()
 						avatars[filepath.Base(event.Name)] = img
@@ -88,5 +90,68 @@ func GetAvatarFromMemory(filename string) (image.Image, bool) {
 	avatarsMutex.RLock()
 	img, exists := avatars[filename]
 	avatarsMutex.RUnlock()
+	return img, exists
+}
+
+func LoadFoods(directory string) error {
+	foods = make(map[string]image.Image)
+	return filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			img, err := LoadImage(path)
+			if err != nil {
+				return err
+			}
+			foods[filepath.Base(path)] = img
+		}
+		return nil
+	})
+}
+
+func WatchFoods(directory string) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		panic(err)
+	}
+	defer watcher.Close()
+
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
+					img, err := LoadImage(event.Name)
+					if err == nil {
+						foodsMutex.Lock()
+						foods[filepath.Base(event.Name)] = img
+						foodsMutex.Unlock()
+					}
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				fmt.Println("error:", err)
+			}
+		}
+	}()
+
+	err = watcher.Add(directory)
+	if err != nil {
+		panic(err)
+	}
+	<-done
+}
+
+func GetFoodFromMemory(filename string) (image.Image, bool) {
+	foodsMutex.RLock()
+	img, exists := foods[filename]
+	foodsMutex.RUnlock()
 	return img, exists
 }
