@@ -1,0 +1,7 @@
+*.json
+*.exe
+*.db
+
+avatar
+foods
+output
