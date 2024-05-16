@@ -53,23 +53,3 @@ func EnsureFoldersExist() {
 		}
 	}
 }
-
-// EnsureFoldersExists 检查并创建必需的文件夹
-func EnsureFoldersExist() {
-	folders := []string{"foods", "output", "avatar"}
-
-	for _, folder := range folders {
-		if _, err := os.Stat(folder); os.IsNotExist(err) {
-			// 文件夹不存在，尝试创建它
-			err := os.Mkdir(folder, 0755) // 使用0755权限以确保读写权限
-			if err != nil {
-				// 如果创建失败，则记录错误并可能退出程序
-				log.Fatalf("Failed to create %s directory: %s", folder, err)
-			}
-			log.Printf("Created %s directory", folder)
-		} else {
-			// 文件夹已存在
-			log.Printf("%s directory already exists", folder)
-		}
-	}
-}
