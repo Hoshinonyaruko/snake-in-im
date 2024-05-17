@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/disintegration/imaging"
@@ -26,6 +27,9 @@ import (
 	"github.com/hoshinonyaruko/snake-in-im/structs"
 	_ "github.com/mattn/go-sqlite3"
 )
+
+// 全局缓存
+var drawingCache sync.Map
 
 func InitDB() *sql.DB {
 	db, err := sql.Open("sqlite3", "game.db")
@@ -231,95 +235,95 @@ func getOrCreateGameMap(db *sql.DB, groupID string, width, height, refreshInterv
 
 // renderImageAndSave 渲染地图并保存为图片
 func renderImageAndSave(gameMap *structs.GameMap, groupID, openID string) error {
+	var dc *gg.Context
 	// 从配置中读取
-	const blockSize = 20
+	blockSize := config.GetConfigValue("blocksize").(int)
 	canvasWidth := gameMap.Width * blockSize
 	canvasHeight := gameMap.Height * blockSize
 
-	// 创建一个新的绘图上下文
-	dc := gg.NewContext(canvasWidth, canvasHeight)
+	// 构造缓存键
+	cacheKey := fmt.Sprintf("%s_%s_%d", groupID, openID, blockSize)
 
-	// 从内存中获取背景图片
-	backgroundFileName := fmt.Sprintf("%s_blur.jpg", openID)
-	bgImg, found := memimg.GetAvatarFromMemory(backgroundFileName)
-	if found {
-		// 计算缩放比例
-		bgWidth := float64(bgImg.Bounds().Dx())
-		bgHeight := float64(bgImg.Bounds().Dy())
-		scaleX := float64(canvasWidth) / bgWidth
-		scaleY := float64(canvasHeight) / bgHeight
-
-		// 使用更大的缩放比例以确保背景完全覆盖画布
-		scale := math.Max(scaleX, scaleY)
-
-		// 设置图像缩放
-		dc.Scale(scale, scale)
-
-		// 由于缩放后，图像的原点也会相应改变，需要重新定位图像
-		offsetX := (float64(canvasWidth) - bgWidth*scale) / 2.0 / scale
-		offsetY := (float64(canvasHeight) - bgHeight*scale) / 2.0 / scale
-
-		dc.DrawImage(bgImg, int(offsetX), int(offsetY))
+	// 尝试从缓存中获取已经绘制好的图像
+	if cachedImg, ok := drawingCache.Load(cacheKey); ok {
+		dc = cachedImg.(*gg.Context)
 	} else {
-		dc.SetRGB(1, 1, 1) // 如果背景图未找到，使用白色背景
-		dc.Clear()
+		// 如果缓存未命中，创建一个新的绘图上下文
+		dc = gg.NewContext(canvasWidth, canvasHeight)
+		// 加载并缩放背景图片
+		renderAndCacheBackground(dc, openID, canvasWidth, canvasHeight)
+
+		// 绘制网格等其他元素
+		renderGrid(dc, canvasWidth, canvasHeight, blockSize)
+		// 将完成的绘图上下文保存到缓存中
+		drawingCache.Store(cacheKey, dc)
 	}
 
-	// 还原缩放和偏移设置以便绘制其他元素
-	dc.Identity()
+	width := gameMap.Width * blockSize
+	height := gameMap.Height * blockSize
 
-	// 绘制网格
-	dc.SetRGB(0.9, 0.9, 0.9) // 设置网格颜色为浅灰
-	for x := 0; x <= canvasWidth; x += blockSize {
-		dc.DrawLine(float64(x), 0, float64(x), float64(canvasHeight))
-		dc.Stroke()
-	}
+	// 创建总的画布
+	finalDC := gg.NewContext(width, height)
+	finalDC.DrawImage(dc.Image(), 0, 0)
 
-	for y := 0; y <= canvasHeight; y += blockSize {
-		dc.DrawLine(0, float64(y), float64(canvasWidth), float64(y))
-		dc.Stroke()
-	}
+	// 创建等待组来同步所有goroutines
+	var wg sync.WaitGroup
 
-	// 绘制每条蛇
+	// 分片处理每个部分的绘图
 	for _, snake := range gameMap.Snakes {
-		for _, pos := range snake.Positions {
-			img, found := memimg.GetAvatarFromMemory(pos.Avatar)
-			if found {
-				dc.DrawImage(img, pos.X*blockSize, pos.Y*blockSize)
-			} else {
-				// 从内存食物中获取对应的食物图像
-				foodImg, found := memimg.GetFoodFromMemory(pos.Avatar)
+		wg.Add(1)
+		go func(snake structs.Snake) {
+			defer wg.Done()
+			// 创建独立的绘图上下文
+			dc := gg.NewContext(width, height)
+			for _, pos := range snake.Positions {
+				img, found := memimg.GetAvatarFromMemory(pos.Avatar)
 				if found {
-					dc.DrawImage(foodImg, pos.X*blockSize, pos.Y*blockSize)
+					dc.DrawImage(img, pos.X*blockSize, pos.Y*blockSize)
 				} else {
-					// 如果食物图片未找到，使用黑色矩形表示该食物位置
-					dc.SetRGB(0, 0, 0) // 如果图片加载失败，使用黑色表示该位置
-					dc.DrawRectangle(float64(pos.X*blockSize), float64(pos.Y*blockSize), float64(blockSize), float64(blockSize))
-					dc.Fill()
+					// 从内存食物中获取对应的食物图像
+					foodImg, found := memimg.GetFoodFromMemory(pos.Avatar)
+					if found {
+						dc.DrawImage(foodImg, pos.X*blockSize, pos.Y*blockSize)
+					} else {
+						// 如果食物图片未找到，使用黑色矩形表示该食物位置
+						dc.SetRGB(0, 0, 0) // 如果图片加载失败，使用黑色表示该位置
+						dc.DrawRectangle(float64(pos.X*blockSize), float64(pos.Y*blockSize), float64(blockSize), float64(blockSize))
+						dc.Fill()
+					}
 				}
-
 			}
-		}
+			// 画布上锁并合并到总画布
+			finalDC.DrawImage(dc.Image(), 0, 0)
+		}(snake)
 	}
 
-	// 绘制食物
+	// 食物的绘制也并行处理
 	for _, foodPos := range gameMap.Food {
-		// 从内存食物中获取对应的食物图像
-		foodImg, found := memimg.GetFoodFromMemory(foodPos.Avatar)
-		if found {
-			dc.DrawImage(foodImg, foodPos.X*blockSize, foodPos.Y*blockSize)
-		} else {
-			// 如果食物图片未找到，使用黑色矩形表示该食物位置
-			dc.SetRGB(0, 0, 0)
-			dc.DrawRectangle(float64(foodPos.X*blockSize), float64(foodPos.Y*blockSize), float64(blockSize), float64(blockSize))
-			dc.Fill()
-		}
+		wg.Add(1)
+		go func(foodPos structs.Position) {
+			defer wg.Done()
+			dc := gg.NewContext(width, height)
+			foodImg, found := memimg.GetFoodFromMemory(foodPos.Avatar)
+			if found {
+				dc.DrawImage(foodImg, foodPos.X*blockSize, foodPos.Y*blockSize)
+			} else {
+				dc.SetRGB(0, 0, 0)
+				dc.DrawRectangle(float64(foodPos.X*blockSize), float64(foodPos.Y*blockSize), float64(blockSize), float64(blockSize))
+				dc.Fill()
+			}
+			// 画布上锁并合并到总画布
+			finalDC.DrawImage(dc.Image(), 0, 0)
+		}(foodPos)
 	}
+
+	// 等待所有goroutines完成
+	wg.Wait()
 
 	// 保存图片
 	fileName := fmt.Sprintf("./output/%s.png", groupID)
 	os.MkdirAll(filepath.Dir(fileName), os.ModePerm)
-	return dc.SavePNG(fileName)
+	return finalDC.SavePNG(fileName)
 }
 
 func scaleImage(img image.Image, newWidth, newHeight int) image.Image {
@@ -383,4 +387,35 @@ func PreloadAndScaleFoods(foodDirectory string, blockSize int) {
 		}
 		return nil
 	})
+}
+
+func renderAndCacheBackground(dc *gg.Context, openID string, width, height int) {
+	backgroundFileName := fmt.Sprintf("%s_blur.jpg", openID)
+	bgImg, found := memimg.GetAvatarFromMemory(backgroundFileName)
+	if found {
+		// 缩放并定位背景图像
+		bgWidth := float64(bgImg.Bounds().Dx())
+		bgHeight := float64(bgImg.Bounds().Dy())
+		scale := math.Max(float64(width)/bgWidth, float64(height)/bgHeight)
+		dc.Scale(scale, scale)
+		offsetX := (float64(width) - bgWidth*scale) / 2.0 / scale
+		offsetY := (float64(height) - bgHeight*scale) / 2.0 / scale
+		dc.DrawImage(bgImg, int(offsetX), int(offsetY))
+	} else {
+		dc.SetRGB(1, 1, 1)
+		dc.Clear()
+	}
+	dc.Identity()
+}
+
+func renderGrid(dc *gg.Context, width, height, blockSize int) {
+	dc.SetRGB(0.9, 0.9, 0.9)
+	for x := 0; x <= width; x += blockSize {
+		dc.DrawLine(float64(x), 0, float64(x), float64(height))
+		dc.Stroke()
+	}
+	for y := 0; y <= height; y += blockSize {
+		dc.DrawLine(0, float64(y), float64(width), float64(y))
+		dc.Stroke()
+	}
 }
