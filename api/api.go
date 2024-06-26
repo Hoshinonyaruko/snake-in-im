@@ -105,6 +105,7 @@ func RenderMapHandler(db *sql.DB) gin.HandlerFunc {
 		height, _ := strconv.Atoi(c.DefaultQuery("height", "20"))
 		refreshInterval, _ := strconv.Atoi(c.DefaultQuery("refresh_interval", "0"))
 		foodName := c.Query("foodname")
+		newDirection := c.Query("direction")
 
 		if avatarUrl != "" {
 			// Process and save the avatar
@@ -123,20 +124,51 @@ func RenderMapHandler(db *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		// 贪食蛇刷新
-		snake.UpdateGameMapIfNeeded(gameMap, openID) // Check and update the game map state
+		// 贪食蛇刷新并接收被吃掉的食物位置
+		eatenPositions, err := snake.UpdateGameMapIfNeeded(gameMap, openID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update game map"})
+			return
+		}
+
 		// 食物刷新
 		if foodName != "" {
 			snake.AddFoodToGameMap(gameMap, foodName)
 		}
+
 		// 绘图
-		renderImageAndSave(&gameMap.Map, groupID, openID) // Render the map and save as an image
+		renderImageAndSave(&gameMap.Map, groupID, openID, newDirection) // Render the map and save as an image
 
 		imageUrl := fmt.Sprintf("http://%s/static/%s.jpg", config.GetConfigValue("selfpath").(string), groupID)
-		c.JSON(http.StatusOK, gin.H{"image_url": imageUrl})
+		// 在JSON中添加eatenPositions
+		c.JSON(http.StatusOK, gin.H{"image_url": imageUrl, "eaten_food_positions": eatenPositions})
 
 		// 持久化
 		sqlite.UpdateGameMapInDB(db, gameMap)
+	}
+}
+
+func DeleteMapHandler(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		groupID := c.Query("groupid")
+
+		// Check if the groupID is provided
+		if groupID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "groupID is required"})
+			return
+		}
+
+		// Call the deleteGameMap function to remove the map
+		err := deleteGameMap(db, groupID)
+		if err != nil {
+			// Log the error and return an appropriate message
+			log.Printf("Failed to delete game map for groupID %s: %v", groupID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Unable to delete game map"})
+			return
+		}
+
+		// If everything goes well, return a success message
+		c.JSON(http.StatusOK, gin.H{"message": "Game map successfully deleted"})
 	}
 }
 
@@ -233,8 +265,41 @@ func getOrCreateGameMap(db *sql.DB, groupID string, width, height, refreshInterv
 	return &game, nil
 }
 
+func deleteGameMap(db *sql.DB, groupID string) error {
+	// 开始一个事务
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+
+	// 删除所有关联的蛇
+	if _, err := tx.Exec("DELETE FROM Snakes WHERE GroupID = ?", groupID); err != nil {
+		tx.Rollback() // 回滚事务
+		return err
+	}
+
+	// 删除所有关联的食物
+	if _, err := tx.Exec("DELETE FROM Foods WHERE GroupID = ?", groupID); err != nil {
+		tx.Rollback() // 回滚事务
+		return err
+	}
+
+	// 删除游戏记录
+	if _, err := tx.Exec("DELETE FROM Games WHERE GroupID = ?", groupID); err != nil {
+		tx.Rollback() // 回滚事务
+		return err
+	}
+
+	// 提交事务
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // renderImageAndSave 渲染地图并保存为图片
-func renderImageAndSave(gameMap *structs.GameMap, groupID, openID string) error {
+func renderImageAndSave(gameMap *structs.GameMap, groupID, openID string, newDirection string) error {
 	var dc *gg.Context
 	// 从配置中读取
 	blockSize := config.GetConfigValue("blocksize").(int)
@@ -242,7 +307,7 @@ func renderImageAndSave(gameMap *structs.GameMap, groupID, openID string) error 
 	canvasHeight := gameMap.Height * blockSize
 
 	// 构造缓存键
-	cacheKey := fmt.Sprintf("%s_%s_%d", groupID, openID, blockSize)
+	cacheKey := fmt.Sprintf("%s_%s_%d_%d_%d", groupID, openID, blockSize, canvasWidth, canvasHeight)
 
 	// 尝试从缓存中获取已经绘制好的图像
 	if cachedImg, ok := drawingCache.Load(cacheKey); ok {
@@ -276,7 +341,7 @@ func renderImageAndSave(gameMap *structs.GameMap, groupID, openID string) error 
 			defer wg.Done()
 			// 创建独立的绘图上下文
 			dc := gg.NewContext(width, height)
-			for _, pos := range snake.Positions {
+			for id, pos := range snake.Positions {
 				img, found := memimg.GetAvatarFromMemory(pos.Avatar)
 				if found {
 					dc.DrawImage(img, pos.X*blockSize, pos.Y*blockSize)
@@ -292,7 +357,56 @@ func renderImageAndSave(gameMap *structs.GameMap, groupID, openID string) error 
 						dc.Fill()
 					}
 				}
+
+				// 在蛇的头部画额外的线条以指示移动方向
+				if id == 0 { // 确认是蛇头
+					// 设置线条颜色为天蓝色
+					dc.SetRGB(0.68, 0.85, 1)
+					length := int(float64(blockSize) * 0.7) // 线条长度稍长
+					var direction string
+
+					// 仅查看 不改变方向
+					if newDirection == "" {
+						direction = snake.Direction
+					} else if snake.OpenID == openID {
+						// 当前操作者的箭头方向(改变方向+查看)
+						direction = newDirection
+					} else {
+						// 其他操作者的箭头方向
+						direction = snake.Direction
+					}
+
+					switch direction {
+					case "up":
+						// Draw two lines forming an upward arrow
+						dc.DrawLine(float64(pos.X*blockSize+blockSize/2), float64(pos.Y*blockSize-blockSize/2),
+							float64(pos.X*blockSize-blockSize/2), float64(pos.Y*blockSize+length))
+						dc.DrawLine(float64(pos.X*blockSize+blockSize-blockSize/2), float64(pos.Y*blockSize-blockSize/2),
+							float64(pos.X*blockSize+blockSize+blockSize/2), float64(pos.Y*blockSize+length))
+					case "down":
+						// Draw two lines forming a downward arrow
+						dc.DrawLine(float64(pos.X*blockSize+blockSize/2), float64(pos.Y*blockSize+blockSize+blockSize/2),
+							float64(pos.X*blockSize-blockSize/2), float64(pos.Y*blockSize-length+blockSize))
+						dc.DrawLine(float64(pos.X*blockSize+blockSize-blockSize/2), float64(pos.Y*blockSize+blockSize+blockSize/2),
+							float64(pos.X*blockSize+blockSize+blockSize/2), float64(pos.Y*blockSize-length+blockSize))
+					case "left":
+						// Draw two lines forming a leftward arrow
+						dc.DrawLine(float64(pos.X*blockSize-blockSize/2), float64(pos.Y*blockSize+blockSize/2),
+							float64(pos.X*blockSize+length), float64(pos.Y*blockSize-blockSize/2))
+						dc.DrawLine(float64(pos.X*blockSize-blockSize/2), float64(pos.Y*blockSize+blockSize-blockSize/2),
+							float64(pos.X*blockSize+length), float64(pos.Y*blockSize+blockSize+blockSize/2))
+					case "right":
+						// Draw two lines forming a rightward arrow
+						dc.DrawLine(float64(pos.X*blockSize+blockSize+blockSize/2), float64(pos.Y*blockSize+blockSize/2),
+							float64(pos.X*blockSize-length+blockSize), float64(pos.Y*blockSize-blockSize/2))
+						dc.DrawLine(float64(pos.X*blockSize+blockSize+blockSize/2), float64(pos.Y*blockSize+blockSize-blockSize/2),
+							float64(pos.X*blockSize-length+blockSize), float64(pos.Y*blockSize+blockSize+blockSize/2))
+					}
+					dc.Stroke() // 完成线条的绘制
+				}
+
 			}
+
 			// 画布上锁并合并到总画布
 			finalDC.DrawImage(dc.Image(), 0, 0)
 		}(snake)
@@ -321,7 +435,7 @@ func renderImageAndSave(gameMap *structs.GameMap, groupID, openID string) error 
 	wg.Wait()
 
 	// 保存图片
-	fileName := fmt.Sprintf("./output/%s.png", groupID)
+	fileName := fmt.Sprintf("./static/%s.jpg", groupID)
 	os.MkdirAll(filepath.Dir(fileName), os.ModePerm)
 	return finalDC.SavePNG(fileName)
 }

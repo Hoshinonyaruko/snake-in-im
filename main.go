@@ -18,10 +18,11 @@ func main() {
 	memimg.LoadAvatars("./avatar")
 	// 加载食物图标
 	memimg.LoadFoods("./foods")
+	// 获取blockSize
+	blockSize := config.GetConfigValue("blocksize").(int)
 	// 预处理
-	api.PreloadAndScaleFoods("./foods", 20)
+	api.PreloadAndScaleFoods("./foods", blockSize)
 	// 检测并热更新到内存 加速绘图
-	go memimg.WatchAvatars("./avatar")
 	go memimg.WatchFoods("./foods")
 	db := api.InitDB()
 	router := gin.Default()
@@ -29,6 +30,8 @@ func main() {
 	router.GET("/update-direction", api.UpdateDirection(db))
 	// 渲染函数 返回静态地址
 	router.GET("/render-map", api.RenderMapHandler(db))
+	// 删除地图
+	router.GET("/delete-map", api.DeleteMapHandler(db))
 	router.Static("/static", "./static") // 静态文件服务
 	// 从配置单例读取端口 监听
 	router.Run(":" + config.GetConfigValue("port").(string))
@@ -36,7 +39,7 @@ func main() {
 
 // EnsureFoldersExists 检查并创建必需的文件夹
 func EnsureFoldersExist() {
-	folders := []string{"foods", "output", "avatar"}
+	folders := []string{"foods", "static", "avatar"}
 
 	for _, folder := range folders {
 		if _, err := os.Stat(folder); os.IsNotExist(err) {

@@ -14,7 +14,13 @@ import (
 	"time"
 
 	"github.com/disintegration/imaging"
+	"github.com/hoshinonyaruko/snake-in-im/memimg"
 	"github.com/hoshinonyaruko/snake-in-im/structs"
+)
+
+var (
+	toDelete            = make(map[string]bool) // 包级变量，记录待删除的蛇
+	collisionCheckCount = 0                     // 用于记录碰撞检查的次数
 )
 
 // 处理和保存头像到avatar文件夹
@@ -40,6 +46,7 @@ func ProcessAndSaveAvatar(avatarUrl, openID string, blockSize int) error {
 
 	// 将原始图像数据保存为文件
 	avatarPath := fmt.Sprintf("./avatar/%s.jpg", openID)
+	avatarFileName := fmt.Sprintf("%s.jpg", openID)
 	err = os.WriteFile(avatarPath, imgData, 0644)
 	if err != nil {
 		return err
@@ -50,6 +57,7 @@ func ProcessAndSaveAvatar(avatarUrl, openID string, blockSize int) error {
 
 	// 保存模糊后的图像
 	blurredAvatarPath := fmt.Sprintf("./avatar/%s_blur.jpg", openID)
+	blurredAvatarFileName := fmt.Sprintf("%s_blur.jpg", openID)
 	outFile, err := os.Create(blurredAvatarPath)
 	if err != nil {
 		return err
@@ -63,6 +71,7 @@ func ProcessAndSaveAvatar(avatarUrl, openID string, blockSize int) error {
 
 	// 保存缩小后的图像
 	smallAvatarPath := fmt.Sprintf("./avatar/%s_small.jpg", openID)
+	smallAvatarFileName := fmt.Sprintf("%s_small.jpg", openID)
 	smallOutFile, err := os.Create(smallAvatarPath)
 	if err != nil {
 		return err
@@ -71,10 +80,32 @@ func ProcessAndSaveAvatar(avatarUrl, openID string, blockSize int) error {
 
 	jpeg.Encode(smallOutFile, scaledImg, &jpeg.Options{Quality: 95}) // 以高质量保存
 
+	// 应用缩小的高斯模糊
+	blurredImgSmall := imaging.Blur(scaledImg, 15) // 调整sigma参数以控制模糊的强度
+
+	// 保存缩小模糊后的图像
+	blurredSmallAvatarPath := fmt.Sprintf("./avatar/%s_blur_small.jpg", openID)
+	blurredSmallAvatarFileName := fmt.Sprintf("%s_blur_small.jpg", openID)
+	outFileSmall, err := os.Create(blurredSmallAvatarPath)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+
+	jpeg.Encode(outFileSmall, blurredImgSmall, &jpeg.Options{Quality: 95}) // 以高质量保存
+
+	// 更新全局avatars数组
+	memimg.AvatarsMutex.Lock()
+	memimg.Avatars[avatarFileName] = img
+	memimg.Avatars[blurredAvatarFileName] = blurredImg
+	memimg.Avatars[smallAvatarFileName] = scaledImg
+	memimg.Avatars[blurredSmallAvatarFileName] = blurredImgSmall
+	memimg.AvatarsMutex.Unlock()
+
 	return nil
 }
 
-func UpdateGameMapIfNeeded(game *structs.Game, openID string) error {
+func UpdateGameMapIfNeeded(game *structs.Game, openID string) ([]structs.Position, error) {
 	currentTime := time.Now().Unix()
 	elapsed := currentTime - game.LastRefresh
 	fmt.Printf("elapsed[%v] game.LastRefresh[%v]\n", elapsed, game.LastRefresh)
@@ -84,7 +115,6 @@ func UpdateGameMapIfNeeded(game *structs.Game, openID string) error {
 	moveCount := elapsed / moveInterval
 	if moveCount == 0 {
 		fmt.Printf("没有到刷新时间,openID[%v]\n", openID)
-		return nil // 还没到刷新时间
 	} else {
 		fmt.Printf("移动次数[%v]\n", moveCount)
 	}
@@ -103,19 +133,44 @@ func UpdateGameMapIfNeeded(game *structs.Game, openID string) error {
 			OpenID:    openID,
 			Direction: randomDirection, // 使用随机方向
 		}
+		moveCount = 1
+	}
+
+	//没有到刷新时间
+	if moveCount == 0 {
+		return nil, nil
+	}
+
+	// 初始化存放所有被吃掉的食物位置的数组
+	allEatenFoodPositions := []structs.Position{}
+
+	// 如果计数可以被5整除，则清理toDelete
+	if collisionCheckCount%5 == 0 {
+		toDelete = make(map[string]bool)
 	}
 
 	// 循环执行移动和碰撞检测
 	for i := int64(0); i < moveCount; i++ {
-		for id, snake := range game.Map.Snakes {
-			game.Map.Snakes[id] = MoveSnake(snake, game.Map.Width, game.Map.Height)
+		for id := range game.Map.Snakes {
+			// 先检测所有蛇是否咬到自己
+			CheckSelfCollision(game.Map.Snakes)
+
+			// 检测碰撞并返回当前被吃掉的食物位置 处理吃掉食物 蛇互相吃掉
+			eatenFoodPositions := CheckCollisions(&game.Map)
+
+			// 根据是否吃到食物移动蛇
+			game.Map.Snakes[id] = MoveSnake(game.Map.Snakes[id], game.Map.Width, game.Map.Height)
+
+			// 将这次循环中被吃掉的食物位置追加到所有被吃掉的食物位置数组中
+			allEatenFoodPositions = append(allEatenFoodPositions, eatenFoodPositions...)
+
 		}
-		CheckCollisions(&game.Map)
 	}
+
 	// 刷新新的时间
 	game.LastRefresh = currentTime
 
-	return nil
+	return allEatenFoodPositions, nil
 }
 
 // 辅助函数：生成带有头像的随机位置 一条新的蛇
@@ -128,6 +183,11 @@ func GenerateRandomPositionWithAvatar(width, height int, avatar string) structs.
 }
 
 func MoveSnake(snake structs.Snake, width, height int) structs.Snake {
+	if len(snake.Positions) == 0 {
+		return snake
+	}
+
+	// 获取头部当前位置
 	head := snake.Positions[0]
 	var newX, newY int
 
@@ -146,20 +206,20 @@ func MoveSnake(snake structs.Snake, width, height int) structs.Snake {
 	// 处理新位置可能超出边界的情况
 	newX, newY = WrapPosition(newX, newY, width, height)
 
-	// 创建新的头部位置，使用前一个头部的avatar属性
+	// 创建新头部位置，使用原头部的头像
 	newHead := structs.Position{X: newX, Y: newY, Avatar: head.Avatar}
 
-	// 更新蛇的每个部分的 Avatar
-	if len(snake.Positions) > 1 {
-		for i := len(snake.Positions) - 1; i > 0; i-- {
-			snake.Positions[i-1].Avatar = snake.Positions[i].Avatar
-		}
-	}
+	// 准备一个新的位置列表，首先添加新头部
+	newPositions := make([]structs.Position, 1, len(snake.Positions))
+	newPositions[0] = newHead
 
-	// 将新头部添加到位置列表，并且移除尾部，以保持蛇的长度
-	newPositions := append([]structs.Position{newHead}, snake.Positions...)
-	if len(newPositions) > 1 {
-		newPositions = newPositions[:len(newPositions)-1] // 保持蛇身长度不变，移除最后一个元素（原尾部）
+	// 更新头像，头像从原头部开始移动，最后一个头像丢弃
+	for i := 1; i < len(snake.Positions); i++ {
+		newPositions = append(newPositions, structs.Position{
+			X:      snake.Positions[i-1].X,
+			Y:      snake.Positions[i-1].Y,
+			Avatar: snake.Positions[i].Avatar, // 将前一个位置的头像移动到当前位置
+		})
 	}
 
 	// 更新蛇的位置列表
@@ -167,6 +227,7 @@ func MoveSnake(snake structs.Snake, width, height int) structs.Snake {
 	return snake
 }
 
+// WrapPosition 确保位置不会超出地图边界
 func WrapPosition(x, y, width, height int) (int, int) {
 	if x < 0 {
 		x += width
@@ -181,87 +242,186 @@ func WrapPosition(x, y, width, height int) (int, int) {
 	return x, y
 }
 
-func CheckCollisions(gameMap *structs.GameMap) {
-	toDelete := make(map[string]bool)
+// 蛇吃到了自己函数
+func CheckSelfCollision(snakes map[string]structs.Snake) {
+	for id, snake := range snakes {
+		if len(snake.Positions) < 2 {
+			// 如果蛇的长度小于2，它不可能咬到自己
+			continue
+		}
+		head := snake.Positions[0]
+		// 检查头部是否与身体的其他部分重叠
+		for _, bodyPart := range snake.Positions[1:] {
+			if head.X == bodyPart.X && head.Y == bodyPart.Y {
+				// 发现碰撞，删除这条蛇
+				delete(snakes, id)
+				break // 退出当前蛇的检查循环
+			}
+		}
+	}
+}
+
+// 更新的CheckCollisions函数，确保立即处理toDelete标记
+func CheckCollisions(gameMap *structs.GameMap) []structs.Position {
 	positionMap := make(map[structs.Position]string)
 
-	// 记录每个位置的蛇ID
+	// 记录每个蛇身体的位置到蛇的ID，但在检查时排除当前检查蛇的身体
 	for id, snake := range gameMap.Snakes {
-		for _, pos := range snake.Positions {
-			positionMap[pos] = id
+		if len(snake.Positions) == 0 || toDelete[id] {
+			continue // 如果蛇已标记为删除或没有位置信息，跳过这条蛇
+		}
+		for i, pos := range snake.Positions {
+			if i != 0 { // 还是保留跳过蛇头的条件以防止将蛇头位置也放入
+				pos.Avatar = ""
+				positionMap[pos] = id
+			}
 		}
 	}
 
 	// 检查头部与其他蛇的身体部分是否重叠
 	for id, snake := range gameMap.Snakes {
+		if len(snake.Positions) == 0 || toDelete[id] {
+			continue // 同样，如果蛇已标记为删除或没有位置信息，跳过这条蛇
+		}
 		head := snake.Positions[0]
+		head.Avatar = ""
+
+		// 清除当前蛇的身体位置信息，以防止自身碰撞的误判
+		for _, pos := range snake.Positions {
+			delete(positionMap, pos)
+		}
+
+		// 检查蛇头是否与其他蛇的身体部分重叠
 		if otherID, exists := positionMap[head]; exists && otherID != id {
-			ResolveCollision(gameMap.Snakes, id, otherID, toDelete)
+			fmt.Printf("处理碰撞,id%v,otherid%v", id, otherID)
+			ResolveCollision(gameMap.Snakes, id, otherID)
+		}
+
+		// 检查结束后重新添加当前蛇的身体到positionMap，为后续检查准备
+		for i, pos := range snake.Positions {
+			if i != 0 {
+				positionMap[pos] = id
+			}
 		}
 	}
 
 	// 检查蛇头是否与食物重叠
-	CheckFoodCollisions(gameMap)
+	eatenFoodPositions := CheckFoodCollisions(gameMap)
 
 	// 删除被吃掉的蛇
 	for id := range toDelete {
 		delete(gameMap.Snakes, id)
 	}
+
+	return eatenFoodPositions
 }
 
-func ResolveCollision(snakes map[string]structs.Snake, snake1ID, snake2ID string, toDelete map[string]bool) {
+func ResolveCollision(snakes map[string]structs.Snake, snake1ID, snake2ID string) {
+	if toDelete[snake1ID] || toDelete[snake2ID] {
+		// 如果其中一条蛇已被标记为删除，则不执行吃操作
+		return
+	}
+
 	snake1 := snakes[snake1ID]
 	snake2 := snakes[snake2ID]
 
 	if len(snake1.Positions) >= len(snake2.Positions) {
-		EatSnake(snakes, snake1ID, snake2ID, toDelete)
+		EatSnake(snakes, snake1ID, snake2ID)
 	} else {
-		EatSnake(snakes, snake2ID, snake1ID, toDelete)
+		EatSnake(snakes, snake2ID, snake1ID)
 	}
 }
 
-func EatSnake(snakes map[string]structs.Snake, eaterID, eatenID string, toDelete map[string]bool) {
+func EatSnake(snakes map[string]structs.Snake, eaterID, eatenID string) {
 	eater := snakes[eaterID]
 	eaten := snakes[eatenID]
 
-	eater.Positions = append(eater.Positions, eaten.Positions...) // 吞并被吃蛇的所有部分
-	toDelete[eatenID] = true                                      // 标记被吃蛇为删除
-
-	UpdateAvatar(&eater, eaten.OpenID) // 更新avatar为吃掉蛇的样式
-	snakes[eaterID] = eater            // 保存回map中
-}
-
-func UpdateAvatar(snake *structs.Snake, eatenOpenID string) {
-	// 更新最近吞并的蛇块的头像，将它们的头像设为被吃蛇的模糊头像
-	for i := range snake.Positions {
-		snake.Positions[i].Avatar = fmt.Sprintf("%s_blur.jpg", eatenOpenID)
+	if len(eaten.Positions) > 0 {
+		fmt.Printf("蛇吃掉了蛇\n")
+		fmt.Printf("蛇吃掉了蛇,toDelete:%v\n", toDelete)
+		lastPosition := eaten.Positions[len(eaten.Positions)-1]
+		eater.Positions = append(eater.Positions, lastPosition)
+		eater.Positions[len(eater.Positions)-1].Avatar = fmt.Sprintf("%s_blur_small.jpg", eaten.OpenID)
 	}
+
+	toDelete[eatenID] = true
+	snakes[eaterID] = eater
 }
 
-// 贪食蛇吃食物函数
-func CheckFoodCollisions(gameMap *structs.GameMap) {
-	var newFoodPositions []structs.Position // 用于存放未被吃掉的食物
+func CheckFoodCollisions(gameMap *structs.GameMap) []structs.Position {
+	eatenFoodPositions := []structs.Position{} // 用于存放被吃掉的食物
+	foodEaten := make(map[int]bool)            // 标记已被吃掉的食物位置
+
 	for _, snake := range gameMap.Snakes {
+		if len(snake.Positions) == 0 { // 检查蛇是否有位置，避免访问空数组
+			continue // 如果这条蛇没有任何位置数据，跳过这条蛇
+		}
 		snakeHead := snake.Positions[0] // 蛇头位置
 		for i, foodPos := range gameMap.Food {
-			if snakeHead.X == foodPos.X && snakeHead.Y == foodPos.Y {
+			if !foodEaten[i] && snakeHead.X == foodPos.X && snakeHead.Y == foodPos.Y {
 				// 蛇吃食物
-				EatFood(&snake, foodPos)
-				//fmt.Printf("蛇吃掉了食物:%v\n", snake)
+				EatFood(&snake, foodPos, gameMap.Width, gameMap.Height)
 				gameMap.Snakes[snake.OpenID] = snake // 更新蛇的状态
-				continue
+				eatenFoodPositions = append(eatenFoodPositions, foodPos)
+				foodEaten[i] = true // 标记食物已被吃掉
 			}
-			// 如果食物未被吃掉，则保留
-			newFoodPositions = append(newFoodPositions, gameMap.Food[i])
+		}
+	}
+
+	// 重建食物数组，排除被吃掉的食物
+	newFoodPositions := []structs.Position{}
+	for i, foodPos := range gameMap.Food {
+		if !foodEaten[i] {
+			newFoodPositions = append(newFoodPositions, foodPos)
 		}
 	}
 	gameMap.Food = newFoodPositions // 更新食物位置列表
+	return eatenFoodPositions       // 返回被吃掉的食物位置
 }
 
-func EatFood(snake *structs.Snake, foodPos structs.Position) {
+func EatFood(snake *structs.Snake, foodPos structs.Position, width int, height int) {
 	// 将食物作为模糊形式添加到蛇的末尾
 	foodPos.Avatar = fmt.Sprintf("%s_blur.png", foodPos.Avatar)
 	foodPos.Avatar = strings.ReplaceAll(foodPos.Avatar, "_small.png", "")
+
+	if len(snake.Positions) == 1 {
+		// 仅有头部，根据头部方向决定尾部的新位置
+		head := snake.Positions[0]
+		foodPos.X = head.X // 从头部复制位置开始
+		foodPos.Y = head.Y // 从头部复制位置开始
+		switch snake.Direction {
+		case "up":
+			foodPos.Y += 1 // 向下增长
+		case "down":
+			foodPos.Y -= 1 // 向上增长
+		case "left":
+			foodPos.X += 1 // 向右增长
+		case "right":
+			foodPos.X -= 1 // 向左增长
+		}
+	} else {
+		// 蛇长度大于1，添加新尾部
+		lastPos := snake.Positions[len(snake.Positions)-1]
+		secondLastPos := snake.Positions[len(snake.Positions)-2]
+		foodPos.X = lastPos.X
+		foodPos.Y = lastPos.Y
+		if foodPos.X == secondLastPos.X {
+			if foodPos.Y < secondLastPos.Y {
+				foodPos.Y -= 1
+			} else {
+				foodPos.Y += 1
+			}
+		} else if foodPos.Y == secondLastPos.Y {
+			if foodPos.X < secondLastPos.X {
+				foodPos.X -= 1
+			} else {
+				foodPos.X += 1
+			}
+		}
+
+		foodPos.X, foodPos.Y = WrapPosition(foodPos.X, foodPos.Y, width, height) // 确保新尾部位置在边界内
+	}
+
 	snake.Positions = append(snake.Positions, foodPos)
 }
 
