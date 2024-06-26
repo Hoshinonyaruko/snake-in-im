@@ -11,14 +11,14 @@ import (
 )
 
 var (
-	avatars      map[string]image.Image
-	avatarsMutex sync.RWMutex
+	Avatars      map[string]image.Image
+	AvatarsMutex sync.RWMutex
 	foods        map[string]image.Image
 	foodsMutex   sync.RWMutex
 )
 
 func LoadAvatars(directory string) error {
-	avatars = make(map[string]image.Image)
+	Avatars = make(map[string]image.Image)
 	return filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -28,7 +28,7 @@ func LoadAvatars(directory string) error {
 			if err != nil {
 				return err
 			}
-			avatars[filepath.Base(path)] = img
+			Avatars[filepath.Base(path)] = img
 		}
 		return nil
 	})
@@ -47,49 +47,10 @@ func LoadImage(path string) (image.Image, error) {
 	return img, nil
 }
 
-func WatchAvatars(directory string) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		panic(err) // 实际开发中应该更优雅地处理错误
-	}
-	defer watcher.Close()
-
-	done := make(chan bool)
-	go func() {
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
-					img, err := LoadImage(event.Name)
-					if err == nil {
-						avatarsMutex.Lock()
-						avatars[filepath.Base(event.Name)] = img
-						avatarsMutex.Unlock()
-					}
-				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				fmt.Println("error:", err)
-			}
-		}
-	}()
-
-	err = watcher.Add(directory)
-	if err != nil {
-		panic(err) // 实际开发中应该更优雅地处理错误
-	}
-	<-done
-}
-
 func GetAvatarFromMemory(filename string) (image.Image, bool) {
-	avatarsMutex.RLock()
-	img, exists := avatars[filename]
-	avatarsMutex.RUnlock()
+	AvatarsMutex.RLock()
+	img, exists := Avatars[filename]
+	AvatarsMutex.RUnlock()
 	return img, exists
 }
 
